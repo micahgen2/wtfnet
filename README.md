@@ -152,3 +152,7 @@ server, lossy Wi-Fi, ICMP-blocked networks, and missing tools.
 - DNS timings include process start-up (~10-30 ms) and caching, so compare them to each other, not to absolutes.
 - A VPN can legitimately hide the default gateway; the verdict accounts for that when traffic is flowing.
 - The profanity is baked into `sass.py`. If you need a SFW version, that's the one file to edit.
+
+## License
+
+[MIT](LICENSE)
