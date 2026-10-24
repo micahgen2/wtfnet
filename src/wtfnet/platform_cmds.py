@@ -62,6 +62,28 @@ def gateway6_cmd(system: str, which: Which = shutil.which) -> List[str]:
     return ["netstat", "-rn", "-A", "inet6"]
 
 
+def wifi_cmd(system: str, which: Which = shutil.which) -> List[str]:
+    """Wi-Fi link details (signal, channel, speed)."""
+    if system == "darwin":
+        # `airport -I` was removed from macOS and `networksetup` misreports. This is slow (~10s)
+        # because it scans for nearby networks, but it's the only thing that works.
+        return ["system_profiler", "-detailLevel", "basic", "SPAirPortDataType"]
+    if system == "windows":
+        return ["netsh", "wlan", "show", "interfaces"]
+    if which("nmcli"):
+        return ["nmcli", "-t", "-f", "ACTIVE,SSID,CHAN,FREQ,RATE,SIGNAL", "dev", "wifi"]
+    return ["iwconfig"]
+
+
+def wifi_flavor(argv: List[str]) -> str:
+    return {"system_profiler": "macos", "netsh": "netsh", "nmcli": "nmcli"}.get(argv[0], "iwconfig")
+
+
+def hwports_cmd() -> List[str]:
+    """macOS: lists which device (en0, en1...) is the Wi-Fi card."""
+    return ["networksetup", "-listallhardwareports"]
+
+
 def ping_cmd(host: str, system: str, count: int = PING_COUNT, family: int = 4) -> List[str]:
     if system == "windows":
         return ["ping"] + (["-6"] if family == 6 else []) + ["-n", str(count), "-w", "2000", host]

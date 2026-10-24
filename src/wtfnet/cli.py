@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import difflib
 import re
 import sys
 import time
@@ -13,8 +14,8 @@ from typing import Callable, List, Optional
 from rich.console import Console
 from rich.markup import escape
 
-from . import __version__, parsers, render
-from .checks import STEPS, STEPS6, Context, has_ipv6
+from . import __version__, config, export, parsers, render, sass
+from .checks import EXTRA_STEP, STEPS, STEPS6, WIFI_STEP, Context, has_ipv6, has_wifi
 from .models import FAIL, OK, WARN, Run
 from .platform_cmds import detect_system
 from .verdict import compute_verdict
@@ -90,32 +91,125 @@ def build_parser() -> argparse.ArgumentParser:
                    help="repeat forever, pausing SECONDS between runs (default: 30). Ctrl-C to stop")
     p.add_argument("--html-report", nargs="?", const=DEFAULT_REPORT, default=None, metavar="FILE",
                    help="also write a self-contained HTML report (default file: %s)" % DEFAULT_REPORT)
+    p.add_argument("--ping-host", dest="ping_hosts", action="append", default=[], type=valid_target,
+                   metavar="HOST", help="also ping this host (repeatable), e.g. your NAS or printer")
     p.add_argument("--no-ipv6", dest="ipv6", action="store_false",
                    help="skip the IPv6 tests (they run automatically if you have a global IPv6 address)")
+    p.add_argument("--no-wifi", dest="wifi", action="store_false",
+                   help="skip the Wi-Fi check (it runs automatically if you're on Wi-Fi)")
+    p.add_argument("--json", action="store_true",
+                   help="print machine-readable JSON instead of the pretty output "
+                        "(with --watch: one JSON object per line)")
+    p.add_argument("--log", default=None, metavar="FILE",
+                   help="append every run to FILE: a summary row if it ends in .csv, "
+                        "a full JSON line otherwise")
+    p.add_argument("--clean", action="store_true",
+                   help="safe-for-work mode: swap the profanity for milder words")
+    p.add_argument("--config", default=None, metavar="FILE",
+                   help="read settings from a TOML file (default: ./wtfnet.toml, then "
+                        "the per-user config). Command-line flags win")
     p.add_argument("--quiet", action="store_true",
                    help="one line per step plus the verdict; hide commands and raw output")
     p.add_argument("--version", action="version", version="wtfnet " + __version__)
     return p
 
 
-def run_once(ctx: Context, console: Console, quiet: bool, run_no: int = 0) -> Run:
+def settings_from_config(raw: dict, source: str) -> dict:
+    """Validate a parsed config file and turn it into argparse defaults. Raises ConfigError."""
+    def bad(key, why):
+        raise config.ConfigError("{}: '{}' {}".format(source, key, why))
+
+    def boolean(key, v):
+        if not isinstance(v, bool):
+            bad(key, "must be true or false")
+        return v
+
+    def string(key, v):
+        if not isinstance(v, str) or not v:
+            bad(key, "must be a non-empty string")
+        return v
+
+    def host(key, v):
+        try:
+            return valid_target(string(key, v))
+        except argparse.ArgumentTypeError as exc:
+            bad(key, str(exc))
+
+    out: dict = {}
+    for key, value in raw.items():
+        if key not in config.KEYS:
+            near = difflib.get_close_matches(key, config.KEYS, n=1)
+            raise config.ConfigError("{}: unknown setting '{}'{}".format(
+                source, key, " (did you mean '{}'?)".format(near[0]) if near else ""))
+        if key in ("target", "dns_name"):
+            out[key] = host(key, value)
+        elif key == "ports":
+            if isinstance(value, bool):
+                bad(key, "must be a port list")
+            text = ",".join(str(x) for x in value) if isinstance(value, list) else str(value)
+            try:
+                out[key] = parse_ports(text)
+            except argparse.ArgumentTypeError as exc:
+                bad(key, str(exc))
+        elif key == "ping_hosts":
+            if not isinstance(value, list):
+                bad(key, "must be a list of hostnames")
+            out[key] = [host(key, h) for h in value]
+        elif key in ("ipv6", "wifi", "clean", "quiet"):
+            out[key] = boolean(key, value)
+        elif key == "watch":
+            if isinstance(value, bool) or not isinstance(value, int):
+                bad(key, "must be a number of seconds")
+            try:
+                out[key] = watch_seconds(str(value))
+            except argparse.ArgumentTypeError as exc:
+                bad(key, str(exc))
+        elif key in ("html_report", "log"):
+            out[key] = string(key, value)
+    return out
+
+
+def _preparse_config_path(argv: Optional[List[str]]) -> Optional[str]:
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None)
+    return pre.parse_known_args(argv)[0].config
+
+
+def _clean_verdict(verdict) -> None:
+    """--clean: scrub the verdict in place so JSON and HTML inherit it."""
+    verdict.headline = sass.clean(verdict.headline)
+    verdict.detail = sass.clean(verdict.detail)
+    verdict.fixes = [sass.clean(f) for f in verdict.fixes]
+
+
+def run_once(ctx: Context, console: Console, quiet: bool, run_no: int = 0,
+             clean: bool = False) -> Run:
     started = dt.datetime.now()
     render.print_banner(console, ctx.system, ctx.target, ctx.ports, run_no)
     ctx.state.clear()  # forget everything learned in a previous run (matters for --watch)
     results = []
     steps = list(STEPS)
+    if ctx.extra_hosts:
+        steps.append(EXTRA_STEP)
     i = 0
     while i < len(steps):
         step = steps[i]
         # The spinner shows progress while slow commands (traceroute!) run.
         with console.status("[{}/{}] {}...".format(i + 1, len(steps), step.label), spinner="dots"):
             result = step.fn(ctx)
-        if step.key == "interfaces" and has_ipv6(ctx):
-            steps.extend(STEPS6)  # we now know this machine has IPv6, so test it too
+        if step.key == "interfaces":
+            if has_wifi(ctx):
+                steps.insert(i + 1, WIFI_STEP)  # on Wi-Fi: the radio is a prime suspect
+            if has_ipv6(ctx):
+                steps.extend(STEPS6)  # we now know this machine has IPv6, so test it too
+        if clean:
+            result.explanation = sass.clean(result.explanation)
         results.append(result)
         i += 1
         render.print_step(console, i, len(steps), result, quiet)
     verdict = compute_verdict(results, ctx.target)
+    if clean:
+        _clean_verdict(verdict)
     render.print_verdict(console, verdict, quiet)
     return Run(started, results, verdict)
 
@@ -126,32 +220,55 @@ def main(
     context_factory: Callable[..., Context] = Context,
     sleep: Callable[[float], None] = time.sleep,
 ) -> int:
-    args = build_parser().parse_args(argv)
-    console = console or Console()
+    parser = build_parser()
+    try:
+        path = config.find_config(_preparse_config_path(argv))
+        if path:
+            parser.set_defaults(**settings_from_config(config.load_config(path), str(path)))
+    except config.ConfigError as exc:
+        parser.error(str(exc))
+    args = parser.parse_args(argv)
+
+    # In --json mode stdout belongs to the data; chatter goes to stderr.
+    info = console or Console(stderr=args.json)
+    screen = Console(quiet=True) if args.json else info
     ctx = context_factory(system=detect_system(), target=args.target, ports=args.ports,
-                          dns_name=args.dns_name, ipv6=args.ipv6)
+                          dns_name=args.dns_name, ipv6=args.ipv6, wifi=args.wifi,
+                          extra_hosts=args.ping_hosts)
 
     runs: List[Run] = []
+    log_failed = False
     try:
         while True:
-            runs.append(run_once(ctx, console, args.quiet, len(runs) + 1 if args.watch else 0))
+            run = run_once(ctx, screen, args.quiet, len(runs) + 1 if args.watch else 0, args.clean)
+            runs.append(run)
+            if args.json:
+                print(export.run_json(run, ctx.system, ctx.target,
+                                      indent=None if args.watch else 2), flush=True)
+            if args.log and not log_failed:
+                try:
+                    export.append_log(args.log, run, ctx.system, ctx.target)
+                except OSError as exc:
+                    log_failed = True
+                    info.print("[red]Can't write the log {}: {}[/red]".format(
+                        escape(args.log), escape(str(exc))), highlight=False)
             if args.watch is None:
                 break
-            console.print("\n[dim]Next run in {}s. Ctrl-C to stop.[/dim]".format(args.watch))
+            info.print("\n[dim]Next run in {}s. Ctrl-C to stop.[/dim]".format(args.watch))
             sleep(args.watch)
     except KeyboardInterrupt:
-        console.print("\n[yellow]Interrupted. Fine, be that way.[/yellow]")
+        info.print("\n[yellow]Interrupted. Fine, be that way.[/yellow]")
 
     if len(runs) > 1:
         tally = Counter(r.verdict.layer for r in runs)
         summary = ", ".join("{} x{}".format(layer, n) for layer, n in tally.most_common())
-        console.print("[bold]{} runs. Verdicts: {}[/bold]".format(len(runs), summary))
+        info.print("[bold]{} runs. Verdicts: {}[/bold]".format(len(runs), summary))
 
     if args.html_report and runs:
         with open(args.html_report, "w", encoding="utf-8") as fh:
             fh.write(render.build_html(runs, ctx.system, ctx.target))
-        console.print("HTML report written to [bold]{}[/bold]".format(escape(args.html_report)),
-                      highlight=False)
+        info.print("HTML report written to [bold]{}[/bold]".format(escape(args.html_report)),
+                   highlight=False)
 
     return EXIT_CODES[runs[-1].verdict.status] if runs else 0
 

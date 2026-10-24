@@ -12,7 +12,7 @@ OK, WARN, FAIL, SKIP = "ok", "warn", "fail", "skip"
 # The layers we can blame, ordered from "closest to your keyboard" to
 # "furthest away". The order matters: if two layers are broken, the lower one
 # is blamed first, because it usually causes the later ones.
-LAYERS = ["local", "gateway", "isp", "dns", "remote", "ipv6"]
+LAYERS = ["local", "gateway", "portal", "isp", "dns", "remote", "hosts", "ipv6"]
 
 
 @dataclass

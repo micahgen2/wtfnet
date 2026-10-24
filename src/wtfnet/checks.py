@@ -9,6 +9,7 @@ implementation; they differ only in which command, hosts and parser they use.
 
 from __future__ import annotations
 
+import os
 import shutil
 import socket
 import time
@@ -16,15 +17,19 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 from . import parsers, sass
+from .httpcheck import HttpResult, format_http, http_probe
 from .models import FAIL, OK, SKIP, WARN, Exec, StepResult
 from .platform_cmds import (
     PING_COUNT,
     gateway6_cmd,
     gateway_cmd,
+    hwports_cmd,
     interfaces_cmd,
     nslookup_cmd,
     ping_cmd,
     traceroute_cmd,
+    wifi_cmd,
+    wifi_flavor,
 )
 from .runner import CommandResult, format_command, run_command
 
@@ -34,6 +39,15 @@ INTERNET_LATENCY_WARN_MS = 150
 DNS_SLOW_MS = 250
 DNS_SLOW_RATIO = 2.5  # system resolver must also be this many times slower than the best public one
 TCP_TIMEOUT = 3.0
+WIFI_SIGNAL_WARN_DBM = -70  # weaker than this is a flaky link
+WIFI_SNR_WARN_DB = 20  # signal must stand at least this far above the noise
+WIFI_RATE_WARN_MBPS = 50
+HTTP_TIMEOUT = 8.0
+HTTP_SLOW_MS = 3000
+CERT_WARN_DAYS = 14
+# Google's connectivity check returns an empty "204 No Content". Anything else on
+# plain HTTP means something is intercepting your traffic (a captive portal).
+CAPTIVE_HOST, CAPTIVE_PATH = "connectivitycheck.gstatic.com", "/generate_204"
 
 INTERNET_HOSTS = {
     4: [("1.1.1.1", "Cloudflare"), ("8.8.8.8", "Google")],
@@ -94,6 +108,11 @@ def system_resolve(name: str, family: int = 4) -> List[str]:
     return sorted({info[4][0] for info in infos})
 
 
+def default_is_wireless(iface: str) -> bool:
+    """Linux: is this network interface a Wi-Fi card?"""
+    return os.path.isdir("/sys/class/net/{}/wireless".format(iface)) or iface.startswith("wl")
+
+
 # ----------------------------------------------------------------- context
 @dataclass
 class Context:
@@ -102,10 +121,14 @@ class Context:
     ports: List[int]
     dns_name: str = "example.com"
     ipv6: bool = True  # False = never run the IPv6 steps (--no-ipv6)
+    wifi: bool = True  # False = never look at the Wi-Fi link (--no-wifi)
+    extra_hosts: List[str] = field(default_factory=list)  # --ping-host
     run: Callable[..., CommandResult] = run_command
     tcp_connect: Callable[..., TcpResult] = tcp_probe
     which: Callable[[str], Optional[str]] = shutil.which
     resolve: Callable[..., List[str]] = system_resolve
+    http_probe: Callable[..., HttpResult] = http_probe
+    is_wireless: Callable[[str], bool] = default_is_wireless
     # Scratch space shared by the steps of ONE battery run (cleared before each run).
     state: Dict[str, object] = field(default_factory=dict)
 
@@ -113,6 +136,27 @@ class Context:
 def has_ipv6(ctx: Context) -> bool:
     """Should the IPv6 steps run? Only if enabled AND we hold a global IPv6 address."""
     return bool(ctx.ipv6 and ctx.state.get("v6_global"))
+
+
+def has_wifi(ctx: Context) -> bool:
+    """Should the Wi-Fi step run? Only if enabled AND the default route uses Wi-Fi."""
+    return bool(ctx.wifi and ctx.state.get("wifi"))
+
+
+def detect_wifi(ctx: Context) -> bool:
+    """Cheaply decide whether we're on Wi-Fi, so wired machines never pay for the slow probe."""
+    if ctx.system == "windows":
+        res = ctx.run(wifi_cmd("windows"), 10)  # netsh is fast and says "connected" itself
+        info = None if res.error else parsers.parse_wifi_netsh(res.output)
+        return bool(info and info.connected)
+    gw = ctx.run(gateway_cmd(ctx.system, ctx.which), 10)
+    iface = None if gw.error else parsers.parse_default_interface(gw.output)
+    if not iface:
+        return False
+    if ctx.system == "darwin":
+        hw = ctx.run(hwports_cmd(), 10)
+        return not hw.error and iface in parsers.parse_hwports_wifi(hw.output)
+    return ctx.is_wireless(iface)
 
 
 def _record(res: CommandResult, system: str) -> Exec:
@@ -186,6 +230,7 @@ def check_interfaces(ctx: Context) -> StepResult:
     link_local = any(i.is_link_local for i in ifaces)
     v6_global = [(i.name, i.ip) for i in parsers.parse_interfaces6(res.output, flavor) if i.is_global]
     ctx.state["v6_global"] = v6_global  # tells the runner whether to add the IPv6 steps
+    ctx.state["wifi"] = detect_wifi(ctx) if ctx.wifi else False  # ...and the Wi-Fi step
     status = OK if usable else FAIL
     return StepResult(
         "interfaces", title, "local", status,
@@ -388,6 +433,94 @@ def check_ports(ctx: Context, fam: int = 4) -> StepResult:
     )
 
 
+def check_wifi(ctx: Context) -> StepResult:
+    title = "Wi-Fi link"
+    argv = wifi_cmd(ctx.system, ctx.which)
+    res = ctx.run(argv, 40)  # macOS scans for networks, which takes ~10s
+    ex = _record(res, ctx.system)
+    if res.error:
+        return StepResult("wifi", title, "gateway", SKIP, sass.skipped(argv[0], res.error), [ex])
+    info = parsers.parse_wifi(res.output, wifi_flavor(argv))
+    if info is None:
+        return StepResult("wifi", title, "gateway", WARN, sass.unparsed(argv[0]), [ex])
+    if not info.connected:
+        return StepResult("wifi", title, "gateway", WARN, sass.wifi(info, [], WARN), [ex],
+                          {"info": info, "issues": []})
+    issues = []
+    if info.signal_dbm is not None and info.signal_dbm < WIFI_SIGNAL_WARN_DBM:
+        issues.append("weak_signal")
+    if info.snr_db is not None and info.snr_db < WIFI_SNR_WARN_DB:
+        issues.append("low_snr")
+    if info.rate_mbps is not None and info.rate_mbps < WIFI_RATE_WARN_MBPS:
+        issues.append("slow_link")
+    status = WARN if issues else OK
+    return StepResult("wifi", title, "gateway", status, sass.wifi(info, issues, status), [ex],
+                      {"info": info, "issues": issues})
+
+
+def check_https(ctx: Context) -> StepResult:
+    title = "HTTPS request to {}".format(ctx.target)
+    if _wrong_family_target(ctx, 4):
+        return StepResult("https", title, "remote", SKIP, sass.wrong_family(ctx.target, 4))
+    r = ctx.http_probe(ctx.target, 443, "/", True, HTTP_TIMEOUT, 4)
+    ex = Exec("python: GET https://{}/  (TLS certificate verified)".format(ctx.target),
+              format_http(r), (r.total_ms or 0) / 1000.0)
+
+    reason = None
+    if r.error:
+        status, reason = FAIL, "HTTPS fails: {}".format(r.detail)
+    elif r.status >= 500:
+        status, reason = FAIL, "the server returns HTTP {}".format(r.status)
+    elif r.cert_days_left is not None and r.cert_days_left < CERT_WARN_DAYS:
+        status, reason = WARN, "its certificate expires in {:.0f} days".format(r.cert_days_left)
+    elif (r.total_ms or 0) > HTTP_SLOW_MS:
+        status, reason = WARN, "HTTPS responses are slow ({:.0f} ms)".format(r.total_ms)
+    else:
+        status = OK  # 4xx counts as OK: the server is alive, it just dislikes a bare GET
+    return StepResult("https", title, "remote", status, sass.http(r, status), [ex],
+                      {"status": r.status, "error": r.error, "reason": reason,
+                       "days_left": r.cert_days_left, "total_ms": r.total_ms})
+
+
+def check_captive(ctx: Context) -> StepResult:
+    title = "Captive portal check"
+    r = ctx.http_probe(CAPTIVE_HOST, 80, CAPTIVE_PATH, False, HTTP_TIMEOUT, 4)
+    ex = Exec("python: GET http://{}{}".format(CAPTIVE_HOST, CAPTIVE_PATH), format_http(r),
+              (r.total_ms or 0) / 1000.0)
+    if r.error:
+        return StepResult("captive", title, "portal", SKIP, sass.captive(r, SKIP), [ex], {"portal": None})
+    if r.status == 204 and not r.body.strip():
+        return StepResult("captive", title, "portal", OK, sass.captive(r, OK), [ex], {"portal": False})
+    # A login page arrives as a 200 with HTML, or as a redirect (301/302/303/307/308).
+    portal = r.status == 200 or r.status in (301, 302, 303, 307, 308)
+    status = FAIL if portal else WARN
+    return StepResult("captive", title, "portal", status, sass.captive(r, status), [ex],
+                      {"portal": portal, "status": r.status, "location": r.headers.get("location")})
+
+
+def check_extra_pings(ctx: Context) -> StepResult:
+    title = "Extra host pings ({})".format(", ".join(ctx.extra_hosts))
+    execs: List[Exec] = []
+    rows: List[Tuple[str, Optional[parsers.PingStats]]] = []
+    statuses: List[str] = []
+    for host in ctx.extra_hosts:
+        ex, stats, err = _ping_host(ctx, host, 6 if parsers.ip_family(host) == 6 else 4)
+        execs.append(ex)
+        if err in ("not_found", "os_error"):
+            return StepResult("hosts", title, "hosts", SKIP, sass.skipped("ping", err), execs)
+        rows.append((host, stats))
+        statuses.append(_classify_ping(stats, INTERNET_LATENCY_WARN_MS) if stats else FAIL)
+    if all(s == OK for s in statuses):
+        status = OK
+    elif all(s == FAIL for s in statuses):
+        status = FAIL
+    else:
+        status = WARN
+    down = [h for h, s in rows if s is None or s.received == 0]
+    return StepResult("hosts", title, "hosts", status, sass.extra_pings(rows, status), execs,
+                      {"down": down, "stats": {h: s for h, s in rows}})
+
+
 @dataclass
 class Step:
     key: str
@@ -402,7 +535,13 @@ STEPS = [
     Step("dns", "Timing DNS resolvers", check_dns),
     Step("traceroute", "Tracing the route (this one's slow, be patient)", check_traceroute),
     Step("ports", "Knocking on TCP ports", check_ports),
+    Step("https", "Making a real HTTPS request", check_https),
+    Step("captive", "Checking for a captive portal", check_captive),
 ]
+
+# Added only when they apply (see cli.run_once).
+WIFI_STEP = Step("wifi", "Reading your Wi-Fi link (macOS makes this slow, be patient)", check_wifi)
+EXTRA_STEP = Step("hosts", "Pinging your extra hosts", check_extra_pings)
 
 # Added to the end of the run only when the machine has a global IPv6 address.
 STEPS6 = [

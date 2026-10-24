@@ -350,3 +350,169 @@ def parse_traceroute(text: str, target: Optional[str] = None) -> TraceResult:
     # trust "a hop answered from the destination's own IP".
     reached = bool(dest and any(h.ip == dest for h in hops))
     return TraceResult(hops, dest, reached)
+
+
+# -------------------------------------------------------------------- Wi-Fi
+@dataclass
+class WifiInfo:
+    connected: bool
+    ssid: Optional[str] = None  # None when the OS hides it (macOS without Location permission)
+    signal_dbm: Optional[float] = None
+    noise_dbm: Optional[float] = None
+    channel: Optional[int] = None
+    band: Optional[str] = None  # "2.4 GHz" | "5 GHz" | "6 GHz"
+    rate_mbps: Optional[float] = None
+    phy: Optional[str] = None  # e.g. "802.11ax"
+
+    @property
+    def snr_db(self) -> Optional[float]:
+        """Signal-to-noise ratio: how far your signal stands above the background hiss."""
+        if self.signal_dbm is None or self.noise_dbm is None:
+            return None
+        return self.signal_dbm - self.noise_dbm
+
+
+def _pct_to_dbm(pct: float) -> float:
+    return pct / 2.0 - 100.0  # the usual rough conversion: 100% = -50 dBm, 0% = -100 dBm
+
+
+def _band_from_ghz(ghz: float) -> str:
+    return "2.4 GHz" if ghz < 3 else "5 GHz" if ghz < 5.9 else "6 GHz"
+
+
+def _num(text: Optional[str]) -> Optional[float]:
+    try:
+        return float(text) if text is not None else None
+    except ValueError:
+        return None
+
+
+def _real_ssid(raw: Optional[str]) -> Optional[str]:
+    raw = (raw or "").strip()
+    return None if not raw or "redacted" in raw.lower() else raw
+
+
+def parse_wifi_macos(text: str) -> Optional[WifiInfo]:
+    """`system_profiler SPAirPortDataType`: the only thing that still works on modern macOS."""
+    if not re.search(r"^\s*Status:", text, re.M):
+        return None
+    if not re.search(r"^\s*Status:\s*Connected", text, re.M):
+        return WifiInfo(False)
+    m = re.search(
+        r"Current Network Information:\s*\n(.*?)(?=\n\s*Other Local Wi-Fi Networks:|\n\s*Current Network Information:|\Z)",
+        text, re.S)
+    if not m:
+        return WifiInfo(True)
+    block = m.group(1)
+    info = WifiInfo(True)
+    first = re.match(r"\s*([^\n]+?):\s*(?:\n|$)", block)
+    info.ssid = _real_ssid(first.group(1)) if first else None
+    g = re.search(r"PHY Mode:\s*(\S+)", block)
+    info.phy = g.group(1) if g else None
+    g = re.search(r"Channel:\s*(\d+)\s*\((\d)\s*GHz", block)
+    if g:
+        info.channel = int(g.group(1))
+        info.band = {"2": "2.4 GHz", "5": "5 GHz", "6": "6 GHz"}.get(g.group(2))
+    g = re.search(r"Signal / Noise:\s*(-?\d+)\s*dBm\s*/\s*(-?\d+)\s*dBm", block)
+    if g:
+        info.signal_dbm, info.noise_dbm = float(g.group(1)), float(g.group(2))
+    g = re.search(r"Transmit Rate:\s*([\d.]+)", block)
+    info.rate_mbps = _num(g.group(1)) if g else None
+    return info
+
+
+def parse_wifi_nmcli(text: str) -> Optional[WifiInfo]:
+    """`nmcli -t -f ACTIVE,SSID,CHAN,FREQ,RATE,SIGNAL dev wifi` (terse: colon-separated)."""
+    rows = []
+    for line in text.splitlines():
+        parts = [p.replace("\\:", ":") for p in re.split(r"(?<!\\):", line)]
+        if len(parts) >= 6:
+            rows.append(parts)
+    if not rows:
+        return None
+    active = [r for r in rows if r[0].lower() == "yes"]
+    if not active:
+        return WifiInfo(False)
+    _, ssid, chan, freq, rate, signal = active[0][:6]
+    info = WifiInfo(True, ssid=_real_ssid(ssid))
+    info.channel = int(chan) if chan.isdigit() else None
+    mhz = _num(re.sub(r"[^\d.]", "", freq) or None)
+    info.band = _band_from_ghz(mhz / 1000.0) if mhz else None
+    info.rate_mbps = _num(re.sub(r"[^\d.]", "", rate) or None)
+    pct = _num(signal)
+    info.signal_dbm = _pct_to_dbm(pct) if pct is not None else None
+    return info
+
+
+def parse_wifi_iwconfig(text: str) -> Optional[WifiInfo]:
+    """`iwconfig` (older Linux without NetworkManager)."""
+    for block in re.split(r"\n(?=\S)", text):
+        if "ESSID" not in block:
+            continue  # lo, eth0: "no wireless extensions"
+        if re.search(r"Access Point:\s*Not-Associated", block) or "ESSID:off/any" in block:
+            return WifiInfo(False)
+        info = WifiInfo(True)
+        g = re.search(r'ESSID:"(.*?)"', block)
+        info.ssid = _real_ssid(g.group(1)) if g else None
+        g = re.search(r"Frequency[:=]\s*([\d.]+)\s*GHz", block)
+        info.band = _band_from_ghz(float(g.group(1))) if g else None
+        g = re.search(r"Bit Rate[:=]\s*([\d.]+)\s*(Mb|Gb)/s", block)
+        if g:
+            info.rate_mbps = float(g.group(1)) * (1000 if g.group(2) == "Gb" else 1)
+        g = re.search(r"Signal level[=:]\s*(-?\d+)\s*dBm", block)
+        if g:
+            info.signal_dbm = float(g.group(1))
+        else:
+            g = re.search(r"Signal level[=:]\s*(\d+)/(\d+)", block)
+            if g:
+                info.signal_dbm = _pct_to_dbm(100.0 * int(g.group(1)) / int(g.group(2)))
+        g = re.search(r"Noise level[=:]\s*(-?\d+)\s*dBm", block)
+        info.noise_dbm = float(g.group(1)) if g else None
+        return info
+    return None
+
+
+def parse_wifi_netsh(text: str) -> Optional[WifiInfo]:
+    """`netsh wlan show interfaces` on Windows."""
+    state = re.search(r"^\s*State\s*:\s*(.+?)\s*$", text, re.M | re.I)
+    if not state:
+        return None
+    if state.group(1).lower() != "connected":
+        return WifiInfo(False)
+    info = WifiInfo(True)
+
+    def field_(name: str) -> Optional[str]:
+        g = re.search(r"^\s*{}\s*:\s*(.+?)\s*$".format(name), text, re.M | re.I)
+        return g.group(1) if g else None
+
+    info.ssid = _real_ssid(field_("SSID"))
+    info.phy = field_("Radio type")
+    chan = field_("Channel")
+    info.channel = int(chan) if chan and chan.isdigit() else None
+    band = field_("Band")
+    if band:
+        info.band = band.replace("GHz", " GHz").replace("  ", " ").strip()
+        info.band = "2.4 GHz" if info.band.startswith("2.4") else info.band
+    elif info.channel:
+        info.band = "2.4 GHz" if info.channel <= 14 else "5 GHz"
+    info.rate_mbps = _num((field_(r"Receive rate \(Mbps\)") or "").strip() or None)
+    pct = re.search(r"(\d+)\s*%", field_("Signal") or "")
+    info.signal_dbm = _pct_to_dbm(float(pct.group(1))) if pct else None
+    return info
+
+
+def parse_wifi(text: str, flavor: str) -> Optional[WifiInfo]:
+    """flavor: 'macos' | 'nmcli' | 'iwconfig' | 'netsh'. None = couldn't make sense of it."""
+    return {"macos": parse_wifi_macos, "nmcli": parse_wifi_nmcli,
+            "iwconfig": parse_wifi_iwconfig, "netsh": parse_wifi_netsh}[flavor](text)
+
+
+def parse_default_interface(text: str) -> Optional[str]:
+    """Which network interface carries the default route? (macOS `interface: en0`, Linux `dev wlan0`)"""
+    m = re.search(r"^\s*interface:\s*(\S+)", text, re.M) or re.search(r"\bdev (\S+)", text)
+    return m.group(1) if m else None
+
+
+def parse_hwports_wifi(text: str) -> List[str]:
+    """Device names of the Wi-Fi hardware ports from macOS `networksetup -listallhardwareports`."""
+    return re.findall(r"Hardware Port:\s*(?:Wi-Fi|AirPort)\s*\nDevice:\s*(\S+)", text)

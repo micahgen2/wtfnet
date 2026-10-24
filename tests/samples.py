@@ -323,3 +323,60 @@ google.com\thas address 142.250.80.46
 
 Authoritative answers can be found from:
 """
+
+
+# ---- Wi-Fi ------------------------------------------------------------------
+WIFI_NMCLI_OK = "no:Neighbour:11:2462 MHz:54 Mbit/s:30\nyes:HomeNet:36:5180 MHz:866 Mbit/s:85\n"
+WIFI_NMCLI_WEAK = "yes:HomeNet:6:2437 MHz:12 Mbit/s:18\n"
+WIFI_NMCLI_DOWN = "no:HomeNet:6:2437 MHz:130 Mbit/s:80\n"
+WIFI_NMCLI_ESCAPED = "yes:Cafe\\: Free:6:2437 MHz:130 Mbit/s:80\n"
+
+WIFI_MACOS_OK = """Wi-Fi:
+
+      Software Versions:
+          CoreWLAN: 16.0 (1657)
+      Interfaces:
+        en0:
+          Card Type: Wi-Fi  (0x14E4, 0x4387)
+          Status: Connected
+          Current Network Information:
+            <redacted>:
+              PHY Mode: 802.11ax
+              Channel: 149 (5GHz, 80MHz)
+              Country Code: US
+              Network Type: Infrastructure
+              Security: WPA2 Personal
+              Signal / Noise: -58 dBm / -92 dBm
+              Transmit Rate: 866
+          Other Local Wi-Fi Networks:
+            <redacted>:
+              PHY Mode: 802.11n
+              Channel: 6 (2GHz, 20MHz)
+"""
+WIFI_MACOS_OFF = """Wi-Fi:
+      Interfaces:
+        en0:
+          Status: Off
+"""
+
+WIFI_IWCONFIG_OK = """lo        no wireless extensions.
+
+wlan0     IEEE 802.11  ESSID:"HomeNet"
+          Mode:Managed  Frequency:5.18 GHz  Access Point: AA:BB:CC:DD:EE:FF
+          Bit Rate=433.3 Mb/s   Tx-Power=22 dBm
+          Link Quality=60/70  Signal level=-50 dBm
+"""
+
+WIFI_NETSH_OK = """
+There is 1 interface on the system:
+
+    Name                   : Wi-Fi
+    State                  : connected
+    SSID                   : HomeNet
+    BSSID                  : aa:bb:cc:dd:ee:ff
+    Radio type             : 802.11ac
+    Channel                : 36
+    Receive rate (Mbps)    : 433.3
+    Transmit rate (Mbps)   : 433.3
+    Signal                 : 92%
+"""

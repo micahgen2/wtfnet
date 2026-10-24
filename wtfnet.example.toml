@@ -1,0 +1,14 @@
+# wtfnet configuration. Every key is optional; command-line flags override these.
+
+target = "example.com"        # host for traceroute, port and HTTPS checks
+ports = [80, 443]             # or a string: "80,443,8000-8005"
+dns_name = "example.com"      # name looked up in the DNS timing test
+ping_hosts = []               # extra machines to ping, e.g. ["192.168.1.50", "nas.lan"]
+
+ipv6 = true                   # false = never run the IPv6 tests
+wifi = true                   # false = never inspect the Wi-Fi link
+clean = false                 # true = swap the profanity for milder words
+quiet = false                 # true = one line per step
+# watch = 60                  # repeat every N seconds
+# html_report = "wtfnet-report.html"
+# log = "wtfnet-log.csv"      # .csv = summary row per run, anything else = JSON lines

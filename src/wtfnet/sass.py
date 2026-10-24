@@ -7,6 +7,7 @@ Keeping the voice separate from the logic means you can rewrite the jokes
 from __future__ import annotations
 
 import random
+import re
 from typing import Dict, List, Optional, Tuple
 
 _rng = random.Random()
@@ -293,6 +294,123 @@ def ports(results: List[object], target: str, status: str) -> str:
     return prefix + "; ".join(parts) + "." + tail
 
 
+# ------------------------------------------------------------------ Wi-Fi
+_WIFI_ISSUES = {
+    "weak_signal": "a signal of {dbm:.0f} dBm is weak (you want stronger than -67)",
+    "low_snr": "your signal is only {snr:.0f} dB above the background noise (you want 25+)",
+    "slow_link": "the negotiated link speed is just {rate:.0f} Mbps",
+}
+
+
+def wifi(info, issues: List[str], status: str) -> str:
+    if info is None:
+        return unparsed("the Wi-Fi tool")
+    if not info.connected:
+        return (
+            "The OS says Wi-Fi isn't connected, yet your traffic is going over it. Either I "
+            "can't read this OS's output properly, or something odd is happening."
+        )
+    where = " to {}".format(info.ssid) if info.ssid else ""
+    bits = []
+    if info.band:
+        bits.append(info.band + (", channel {}".format(info.channel) if info.channel else ""))
+    if info.signal_dbm is not None:
+        bits.append("signal {:.0f} dBm".format(info.signal_dbm))
+    if info.snr_db is not None:
+        bits.append("{:.0f} dB above the noise".format(info.snr_db))
+    if info.rate_mbps is not None:
+        bits.append("link speed {:.0f} Mbps".format(info.rate_mbps))
+    summary = "Connected{} ({}).".format(where, ", ".join(bits)) if bits else "Connected{}.".format(where)
+    if not issues:
+        return summary + pick(
+            " That's a healthy link, so if things are slow, it isn't your radio.",
+            " Solid. Your Wi-Fi is doing its job for once.",
+        )
+    reasons = "; ".join(_WIFI_ISSUES[i].format(
+        dbm=info.signal_dbm or 0, snr=info.snr_db or 0, rate=info.rate_mbps or 0) for i in issues)
+    text = "{} Your Wi-Fi link is a mess: {}. Move closer to the router, get clear of walls and " \
+           "microwaves, or just plug in a cable.".format(summary, reasons)
+    if info.band == "2.4 GHz":
+        text += " You're also on 2.4 GHz, the slow, crowded band. Use 5 or 6 GHz if your router offers it."
+    return text
+
+
+def wifi_note(info, issues: List[str]) -> str:
+    """One sentence appended to the GATEWAY verdict when the Wi-Fi radio itself is the culprit."""
+    reasons = "; ".join(_WIFI_ISSUES[i].format(
+        dbm=info.signal_dbm or 0, snr=info.snr_db or 0, rate=info.rate_mbps or 0) for i in issues)
+    return "And the cause is visible: {}.".format(reasons)
+
+
+# ------------------------------------------------------------ HTTPS / TLS
+def _slowest(r) -> str:
+    phases = [("DNS", r.dns_ms), ("TCP connect", r.connect_ms), ("TLS handshake", r.tls_ms),
+              ("waiting for the server", r.ttfb_ms)]
+    phases = [(n, v) for n, v in phases if v is not None]
+    return max(phases, key=lambda p: p[1])[0] if phases else "unknown"
+
+
+def http(r, status: str) -> str:
+    host = r.url.split("/")[2]
+    if r.error == "dns":
+        return "Couldn't even look up {}. {}. Check the spelling, or it's DNS (see above).".format(host, r.detail)
+    if r.error == "tls_verify":
+        return (
+            "The TLS certificate was rejected: {}. Either the site's cert is busted, something "
+            "(a captive portal, antivirus, corporate proxy) is intercepting HTTPS, or your "
+            "computer's clock is wrong. Check the date and time first. It's embarrassing how "
+            "often that's it.".format(r.detail)
+        )
+    if r.error == "tls":
+        return "The TLS handshake failed ({}). Your machine and the server couldn't agree how to encrypt.".format(r.detail)
+    if r.error:
+        return "TCP might connect, but a real HTTPS request didn't work: {}.".format(r.detail)
+    base = "Got {} in {:.0f} ms (slowest part: {}).".format(r.status, r.total_ms or 0, _slowest(r))
+    if r.status >= 500:
+        return "{} The server is up but throwing errors. That's their server shitting itself, not your network.".format(base)
+    if r.cert_days_left is not None and r.cert_days_left < 14:
+        return ("{} But the certificate expires in {:.0f} days. Tell whoever runs it, or this "
+                "becomes a very sudden outage.".format(base, r.cert_days_left))
+    if status == "warn":
+        return "{} That's slow. Look at the slowest phase and check it against the DNS and ping results.".format(base)
+    note = ""
+    if r.status >= 400:
+        note = " (A {} just means the server dislikes a bare GET. It's alive, which is what I care about.)".format(r.status)
+    return base + " Certificate valid for {:.0f} more days. The site works end to end, not just the port.{}".format(
+        r.cert_days_left if r.cert_days_left is not None else 0, note)
+
+
+def captive(r, status: str) -> str:
+    if r.error:
+        return ("I couldn't run the captive portal check ({}). Can't tell either way. If the "
+                "internet is down, that's why.".format(r.detail))
+    if r.status == 204 and not r.body.strip():
+        return ("Got the empty 204 response Google's connectivity check should return, so nobody "
+                "is tampering with your web traffic. No captive portal.")
+    where = " (redirecting to {})".format(r.headers["location"]) if r.headers.get("location") else ""
+    if status == "fail":
+        return (
+            "Expected a blank 204 and got {}{} instead. Something between you and the internet "
+            "is answering web requests with its own page. That's a captive portal: the login "
+            "screen on hotel, airport and cafe Wi-Fi.".format(r.status, where)
+        )
+    return "Got an unexpected {} from the connectivity check. Odd, but it doesn't look like a login page.".format(r.status)
+
+
+# ------------------------------------------------------------ extra hosts
+def extra_pings(rows: List[Tuple[str, object]], status: str) -> str:
+    """rows: (host, PingStats|None)."""
+    up = [h for h, s in rows if s is not None and s.received > 0]
+    down = [h for h, s in rows if s is None or s.received == 0]
+    if not down:
+        return "Every host you asked about answered: {}. They're alive and not ignoring you.".format(", ".join(up))
+    if not up:
+        return ("None of your extra hosts answered ({}). If the rest of the network is fine, those "
+                "machines are down, asleep, firewalled, or on another network.".format(", ".join(down)))
+    return "{} answered, but {} didn't. The silent ones are down, asleep, or ignoring ping.".format(
+        ", ".join(up), ", ".join(down))
+
+
 # ---------------------------------------------------------------- verdict
 # layer -> status -> (headline, detail, fixes)
 _V: Dict[Tuple[str, str], Tuple[str, str, List[str]]] = {
@@ -379,10 +497,21 @@ _V: Dict[Tuple[str, str], Tuple[str, str, List[str]]] = {
             "Reboot the router if you're using its built-in DNS.",
         ],
     ),
+    ("portal", "fail"): (
+        "CAPTIVE PORTAL: this network wants you to log in first.",
+        "Something between you and the internet is intercepting plain web traffic and answering "
+        "with its own page. That's a captive portal, the login screen on hotel, airport and cafe "
+        "Wi-Fi. Until you click through it, DNS and web requests can look broken even though pings work.",
+        [
+            "Open a browser and go to http://neverssl.com. It never uses HTTPS, so the login page can intercept it.",
+            "Accept the terms or sign in, then rerun wtfnet.",
+            "No login page appears? Disconnect and reconnect to the Wi-Fi to trigger it again.",
+        ],
+    ),
     ("remote", "fail"): (
         "REMOTE: it's them, not you.",
-        "Your network and DNS are fine, but {target} isn't accepting connections on the ports "
-        "tested. The server is down, firewalled, or you've got the wrong host or port.",
+        "Your network and DNS are fine, but {target} is broken from here ({notes}). The server "
+        "is down, firewalled, or you've got the wrong host or port.",
         [
             "Check the service's status page, or try from your phone on mobile data.",
             "Double-check --target and --ports.",
@@ -390,10 +519,19 @@ _V: Dict[Tuple[str, str], Tuple[str, str, List[str]]] = {
         ],
     ),
     ("remote", "warn"): (
-        "REMOTE (partial): some of {target}'s ports aren't answering.",
-        "Your network is fine. Some of the ports you asked about on {target} are closed or "
-        "filtered. That might be normal or it might be the server's problem.",
+        "REMOTE (partial): {target} isn't fully healthy.",
+        "Your network is fine, but {target} has problems: {notes}. That might be normal or it "
+        "might be the server's problem.",
         ["Make sure every port you listed is actually supposed to be open."],
+    ),
+    ("hosts", "warn"): (
+        "YOUR HOSTS: {hosts} not answering.",
+        "The internet is fine, but the extra machines you asked me to ping aren't all reachable. "
+        "They're down, asleep, firewalled, or on a different network.",
+        [
+            "Check the machine is powered on and on the same network or VPN.",
+            "Some devices ignore ping on purpose. Try reaching them the way you normally would.",
+        ],
     ),
     ("ipv6", "warn"): (
         "IPv6 (broken): IPv4 works fine, IPv6 doesn't.",
@@ -410,6 +548,43 @@ _V: Dict[Tuple[str, str], Tuple[str, str, List[str]]] = {
 }
 
 
-def verdict(layer: str, status: str, target: str) -> Tuple[str, str, List[str]]:
+def verdict(layer: str, status: str, target: str, notes: str = "",
+            hosts: str = "") -> Tuple[str, str, List[str]]:
+    """notes: what's wrong with the target (REMOTE); hosts: the unreachable extra hosts (YOUR HOSTS)."""
     headline, detail, fixes = _V.get((layer, status)) or _V[("none", "warn")]
-    return headline.format(target=target), detail.format(target=target), list(fixes)
+    fmt = dict(target=target, notes=notes or "the ports tested aren't answering", hosts=hosts)
+    return headline.format(**fmt), detail.format(**fmt), list(fixes)
+
+
+# ------------------------------------------------------------ safe for work
+# Ordered (pattern, replacement) pairs. Specific phrases first so they read naturally,
+# generic word swaps last. A test checks that NO string in this file survives clean().
+_CLEAN = [
+    (r"slow as (?:fuck|shit)", "very slow"),
+    (r"flaky-ass", "flaky"),
+    (r"flaky as hell", "very flaky"),
+    (r"shit the bed", "fell over"),
+    (r"shitting itself", "falling over"),
+    (r"a shit\b", "a hoot"),
+    (r"fuck it", "forget it"),
+    (r"bullshit", "nonsense"),
+    (r"assholes?", "jerks"),
+    (r"\bdick\b", "jerk"),
+    (r"\bdamn\b", "darn"),
+    (r"\bfucking\b", "freaking"),
+    (r"\bfuck(?:ed)?\b", "heck"),
+    (r"\bshit\b", "stuff"),
+    (r"\bhell\b", "heck"),
+    (r"\bass\b", "butt"),
+]
+
+
+def _match_case(original: str, replacement: str) -> str:
+    return replacement[:1].upper() + replacement[1:] if original[:1].isupper() else replacement
+
+
+def clean(text: str) -> str:
+    """Swap the profanity for milder words (--clean)."""
+    for pattern, replacement in _CLEAN:
+        text = re.sub(pattern, lambda m, r=replacement: _match_case(m.group(0), r), text, flags=re.I)
+    return text

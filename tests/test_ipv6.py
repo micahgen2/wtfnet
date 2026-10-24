@@ -151,9 +151,9 @@ def test_linux_interfaces_command_lists_both_families():
 
 
 # ----------------------------------------------------------- scenarios
-def test_healthy_dual_stack_runs_eleven_steps_and_all_pass(healthy6):
+def test_healthy_dual_stack_runs_thirteen_steps_and_all_pass(healthy6):
     steps, v = run_all(healthy6)[:2]
-    assert len(steps) == 11 and all(s.status == OK for s in steps.values())
+    assert len(steps) == 13 and all(s.status == OK for s in steps.values())
     assert (v.layer, v.status) == ("none", OK)
     assert any("IPv6 is reachable" in e for e in v.evidence)
 
@@ -170,18 +170,18 @@ def test_ipv6_steps_show_exact_commands(healthy6):
 
 def test_no_global_ipv6_means_no_ipv6_steps_and_a_friendly_note(healthy):
     steps = run_all(healthy)[0]
-    assert len(steps) == 6 and "gateway6" not in steps
+    assert len(steps) == 8 and "gateway6" not in steps
     assert "IPv4-only" in steps["interfaces"].explanation
 
 
 def test_link_local_and_private_ula_dont_trigger_ipv6_tests():
     net = FakeNet(ifaces=S.IFACES_IP_V6_LOCAL_ONLY)
-    assert len(run_all(net)[0]) == 6
+    assert len(run_all(net)[0]) == 8
 
 
 def test_no_ipv6_flag_disables_the_steps_even_with_an_address(healthy6):
     steps = run_all(healthy6, ipv6=False)[0]
-    assert len(steps) == 6 and "IPv6" not in steps["interfaces"].explanation
+    assert len(steps) == 8 and "IPv6" not in steps["interfaces"].explanation
 
 
 def test_ipv6_broken_while_ipv4_fine_is_a_warning_not_a_blame_on_the_isp():
@@ -293,22 +293,22 @@ def test_cli_shows_ipv6_steps_with_a_dynamic_total():
     console = make_console()
     assert cli.main([], console, factory_for(FakeNet(v6=True))) == 0
     out = console.file.getvalue()
-    assert "[1/11]" in out and "[11/11]" in out
+    assert "[1/13]" in out and "[13/13]" in out
     assert "$ ping -6 -c 4" in out and "IPv6 gateway ping" in out
 
 
-def test_cli_without_ipv6_keeps_six_steps():
+def test_cli_without_ipv6_keeps_eight_steps():
     console = make_console()
     cli.main([], console, factory_for(FakeNet()))
     out = console.file.getvalue()
-    assert "[6/6]" in out and "IPv6 gateway" not in out
+    assert "[8/8]" in out and "IPv6 gateway" not in out
 
 
 def test_cli_no_ipv6_flag():
     console = make_console()
     cli.main(["--no-ipv6"], console, factory_for(FakeNet(v6=True)))
     out = console.file.getvalue()
-    assert "[6/6]" in out and "IPv6 internet" not in out
+    assert "[8/8]" in out and "IPv6 internet" not in out
 
 
 def test_watch_forgets_ipv6_between_runs_if_it_disappears():

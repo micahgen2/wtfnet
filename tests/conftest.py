@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import samples as S  # noqa: E402
 
 from wtfnet.checks import Context, TcpResult  # noqa: E402
+from wtfnet.httpcheck import HttpResult  # noqa: E402
 from wtfnet.runner import CommandResult  # noqa: E402
 
 GW = "192.168.1.1"
@@ -28,7 +29,8 @@ class FakeNet:
     def __init__(self, ifaces=None, gateway=S.GATEWAY_LINUX, gw_ping=None, cf_ping=None,
                  g_ping=None, dns=None, trace=S.TRACE_UNIX_REACHED, ports=None, missing=(),
                  v6=False, gateway6=S.GATEWAY6_LINUX, gw6_ping=None, cf6_ping=None, g6_ping=None,
-                 dns6=None, trace6=S.TRACE6_UNIX_REACHED, ports6=None):
+                 dns6=None, trace6=S.TRACE6_UNIX_REACHED, ports6=None, wifi=None,
+                 https=None, captive=None, extra_pings=None):
         self.ifaces = ifaces if ifaces is not None else (S.IFACES_IP_V6 if v6 else S.IFACES_IP)
         self.gateway = gateway
         self.pings = {GW: gw_ping or S.PING_LINUX_OK.replace("1.1.1.1", GW),
@@ -47,6 +49,13 @@ class FakeNet:
         self.ports = ports if ports is not None else {80: "open", 443: "open"}
         self.ports6 = ports6 if ports6 is not None else dict(self.ports)
         self.missing = set(missing)  # commands that "aren't installed"
+        self.wifi = wifi  # nmcli output; None = a wired machine (no Wi-Fi step at all)
+        self.https = https or HttpResult("https://example.com/", status=200, reason="OK",
+                                         total_ms=120.0, cert_days_left=90.0, tls_version="TLSv1.3")
+        self.captive = captive or HttpResult("http://connectivitycheck.gstatic.com/generate_204",
+                                             status=204, reason="No Content", total_ms=30.0)
+        for host, out in (extra_pings or {}).items():
+            self.pings[host] = out
         self.calls = []
 
     def __call__(self, argv, timeout=30):
@@ -60,6 +69,8 @@ class FakeNet:
             out = self.gateway6
         elif cmd == "ip":
             out = self.gateway
+        elif cmd == "nmcli":
+            out = self.wifi
         elif cmd == "ping":
             out = self.pings[argv[-1]]
         elif cmd == "nslookup":
@@ -77,10 +88,14 @@ class FakeNet:
         detail = {"filtered": "timed out after 3s", "noaddr": "%s has no IPv6 (AAAA) address" % host}.get(state, "")
         return TcpResult(port, state, 20.0 if state in ("open", "closed") else None, detail)
 
+    def http(self, host, port=443, path="/", tls=True, timeout=5.0, family=4):
+        return self.https if tls else self.captive
+
     def context(self, **kw):
         kw.setdefault("target", "example.com")
         return Context(system="linux", ports=sorted(self.ports), run=self,
-                       tcp_connect=self.tcp, which=lambda name: "/usr/bin/" + name,
+                       tcp_connect=self.tcp, http_probe=self.http,
+                       is_wireless=lambda iface: self.wifi is not None, which=lambda name: "/usr/bin/" + name,
                        resolve=lambda name, family=4: ["93.184.216.34" if family == 4 else CF6], **kw)
 
 

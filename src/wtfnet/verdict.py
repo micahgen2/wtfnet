@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from . import sass
 from .models import FAIL, LAYERS, OK, SKIP, WARN, StepResult, Verdict
@@ -35,6 +35,7 @@ def compute_verdict(results: List[StepResult], target: str) -> Verdict:
         evidence.append("Internet is reachable (proved by: {})".format(", ".join(alive_via)))
 
     problems: List[Tuple[str, str]] = []  # (layer, severity)
+    wifi_blame: Optional[Tuple[object, List[str]]] = None
 
     if status("interfaces") == FAIL and not alive:
         problems.append(("local", FAIL))
@@ -51,6 +52,20 @@ def compute_verdict(results: List[StepResult], target: str) -> Verdict:
     elif gw in (FAIL, WARN):
         # The router IS answering, just badly (heavy loss or latency): a degraded link.
         problems.append(("gateway", WARN))
+
+    # A weak radio is a degraded local link even when pings look fine.
+    if "wifi" in r:
+        wd = r["wifi"].data
+        if status("wifi") == WARN and wd.get("issues"):
+            problems.append(("gateway", WARN))
+            wifi_blame = (wd["info"], wd["issues"])
+            evidence.append("Wi-Fi link is weak: " + ", ".join(wd["issues"]))
+        elif status("wifi") == OK:
+            evidence.append("Wi-Fi link looks healthy ({:.0f} dBm)".format(wd["info"].signal_dbm or 0))
+
+    # A captive portal makes web traffic and DNS look broken while pings still work.
+    if "captive" in r and r["captive"].data.get("portal"):
+        problems.append(("portal", FAIL))
 
     inet = status("internet")
     if not alive and inet in (FAIL, WARN) and gw != FAIL:
@@ -69,13 +84,30 @@ def compute_verdict(results: List[StepResult], target: str) -> Verdict:
     elif dns == WARN:
         problems.append(("dns", WARN))
 
+    # Everything about the target: ports first, then a real HTTPS request.
+    remote_notes: List[str] = []
+    remote_sev: Optional[str] = None
     ports = status("ports")
     if alive and ports == FAIL:
-        problems.append(("remote", FAIL))
+        remote_sev = FAIL
+        remote_notes.append("no port you asked about is open")
     elif alive and ports == WARN:
-        problems.append(("remote", WARN))
+        remote_sev = WARN
+        remote_notes.append("some ports are closed or filtered")
+    https = status("https")
+    if alive and ports != FAIL and https in (FAIL, WARN):
+        remote_notes.append(r["https"].data.get("reason") or "the HTTPS request had problems")
+        remote_sev = FAIL if (https == FAIL or remote_sev == FAIL) else WARN
+    if remote_sev:
+        problems.append(("remote", remote_sev))
     if alive and "traceroute" in r and not r["traceroute"].data.get("reached"):
         evidence.append("Traceroute never reached the target (many hosts block it)")
+
+    # The user's own extra hosts (--ping-host): only meaningful if the internet works.
+    down_hosts = r["hosts"].data.get("down", []) if "hosts" in r else []
+    if alive and down_hosts:
+        problems.append(("hosts", WARN))
+        evidence.append("Not answering: " + ", ".join(down_hosts))
 
     # IPv6 steps only exist when the machine has a global IPv6 address. A broken
     # IPv6 is only a *warning*: IPv4 still works, apps just stall before falling back.
@@ -102,8 +134,14 @@ def compute_verdict(results: List[StepResult], target: str) -> Verdict:
     for severity in (FAIL, WARN):
         hits = sorted((layer for layer, sev in problems if sev == severity), key=LAYERS.index)
         if hits:
-            h, d, f = sass.verdict(hits[0], severity, target)
-            return Verdict(hits[0], severity, h, d, f, evidence)
+            layer = hits[0]
+            h, d, f = sass.verdict(layer, severity, target, "; ".join(remote_notes), ", ".join(down_hosts))
+            if layer == "gateway" and wifi_blame:
+                d += " " + sass.wifi_note(*wifi_blame)
+            if layer == "remote" and r.get("https") and r["https"].data.get("error") == "tls_verify":
+                f.append("If the certificate error says 'expired' or 'not yet valid', check your "
+                         "computer's date and time.")
+            return Verdict(layer, severity, h, d, f, evidence)
 
     h, d, f = sass.verdict("none", OK, target)
     return Verdict("none", OK, h, d, f, evidence)

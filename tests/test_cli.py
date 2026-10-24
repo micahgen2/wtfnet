@@ -16,7 +16,9 @@ def make_console():
 def factory_for(net):
     def factory(**kw):
         ctx = net.context()
-        ctx.target, ctx.ports, ctx.dns_name, ctx.ipv6 = kw["target"], kw["ports"], kw["dns_name"], kw["ipv6"]
+        for name, value in kw.items():
+            if name != "system":
+                setattr(ctx, name, value)
         return ctx
     return factory
 
